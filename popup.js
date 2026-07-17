@@ -1,98 +1,447 @@
-<!doctype html>
-<html lang="ca">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Temporitzador de descansos</title>
+// -----------------------------------------------------
+// MINUTS AL JARDÍ
+// Interfície del popup
+// -----------------------------------------------------
 
-  <!-- Estils CSS -->
-  <link rel="stylesheet" href="style.css" />
-  
-  <script src="libs/p5.min.js"></script>
-<script src="libs/p5.sound.min.js"></script>
+let timerState = null;
 
+let customFields;
+let workMin;
+let restMin;
 
-  <!-- sketch primer (canvas, música, botó Mode) -->
-  <script src="sketch.js" defer></script>
+let startPauseBtn;
+let resetBtn;
+let skipBtn;
 
-  <!-- després la lògica del temporitzador -->
-  <script src="popup.js" defer></script>
-</head>
-<body>
-  <div id="app" role="application" aria-label="Temporitzador de descansos">
-    
-    <header>
+let musicToggle;
+let notifToggle;
 
-      <!-- Línia superior: icona + títol centrat -->
-      <div class="header-title-row">
-        <img src="assets/icon48.png" alt="" class="header-icon" />
-        <h1>TEMPORITZADOR</h1>
-      </div>
+let phaseLabel;
+let timeLabel;
 
-      <!-- Segona barra: (p5.js generarà aquí el botó Mode) -->
-      <div id="presetMenu"></div>
+function getElement(id) {
+  return document.getElementById(id);
+}
 
-      <!-- Camps per al mode personalitzat -->
-      <div id="custom-fields" class="hidden" aria-live="polite">
-        <label>
-          Treball
-          <input id="workMin" type="number" min="1" max="180" value="20" />
-        </label>
-        <label>
-          Descans
-          <input id="restMin" type="number" min="1" max="60" value="5" />
-        </label>
-      </div>
+function msToMMSS(milliseconds) {
+  const totalSeconds = Math.max(
+    0,
+    Math.ceil(milliseconds / 1000)
+  );
 
-    </header>
+  const minutes = Math.floor(
+    totalSeconds / 60
+  )
+    .toString()
+    .padStart(2, '0');
 
-    <main>
+  const seconds = (
+    totalSeconds % 60
+  )
+    .toString()
+    .padStart(2, '0');
 
-      <!-- CANVAS p5.js -->
-      <div id="canvas-holder" aria-label="Visualització del temps"></div>
+  return `${minutes}:${seconds}`;
+}
 
-      <!-- Estat textual: fase + temps -->
-      <div class="status-row" aria-live="polite">
-        <span id="phaseLabel">Treball</span>
-        <span id="timeLabel">25:00</span>
-      </div>
+function getRemainingMs() {
+  if (!timerState) return 0;
 
-      <!-- Controls -->
-      <div class="controls">
-  <button id="startPauseBtn" type="button">Inicia</button>
+  if (
+    timerState.isRunning &&
+    Number.isFinite(timerState.endsAt)
+  ) {
+    return Math.max(
+      0,
+      timerState.endsAt - Date.now()
+    );
+  }
 
-  <button id="resetBtn" type="button" class="secondary">
-    Reinicia
-  </button>
+  return Math.max(
+    0,
+    timerState.remainingMs
+  );
+}
 
-  <button id="skipBtn" type="button" class="secondary">
-    Salta fase
-  </button>
+async function sendTimerMessage(
+  type,
+  data = {}
+) {
+  try {
+    const response =
+      await browser.runtime.sendMessage({
+        type,
+        ...data
+      });
 
-        <label class="inline">
-          <input type="checkbox" id="musicToggle" checked />
-          Música
-        </label>
+    if (response?.state) {
+      timerState = response.state;
+      updateInterface();
+      syncP5();
+      updateMusicPlayback();
+    }
 
-        <label class="inline">
-          <input type="checkbox" id="notifToggle" checked />
-          Notificació
-        </label>
-      </div>
+    return response;
+  } catch (error) {
+    console.error(
+      'Error comunicant amb el temporitzador:',
+      error
+    );
 
-      <!-- Botó de restablir dades -->
-      <button id="clearDataBtn" class="danger">Restablir dades</button>
+    return null;
+  }
+}
 
-    </main>
+async function loadTimerState() {
+  await sendTimerMessage(
+    'TIMER_GET_STATE'
+  );
+}
 
-    <footer>
-      <small>
-        Estat persistent amb <code>storeItem()</code> / <code>getItem()</code>.
-      </small>
-    </footer>
+function updateInterface() {
+  if (!timerState) return;
 
-  </div>
-</body>
-</html>
+  const remaining =
+    getRemainingMs();
 
+  phaseLabel.textContent =
+    timerState.phase === 'work'
+      ? 'Treball'
+      : 'Descans';
 
+  timeLabel.textContent =
+    msToMMSS(remaining);
+
+  startPauseBtn.textContent =
+    timerState.isRunning
+      ? 'Pausa'
+      : 'Inicia';
+
+  startPauseBtn.setAttribute(
+    'aria-label',
+    timerState.isRunning
+      ? 'Pausar el temporitzador'
+      : 'Iniciar el temporitzador'
+  );
+
+  musicToggle.checked =
+    timerState.music;
+
+  notifToggle.checked =
+    timerState.notif;
+
+  document.body.dataset.phase =
+    timerState.phase;
+}
+
+function syncP5() {
+  if (
+    !timerState ||
+    typeof window.p5UpdateConfig !==
+      'function'
+  ) {
+    return;
+  }
+
+  window.p5UpdateConfig({
+    ...timerState,
+    remainingMs: getRemainingMs()
+  });
+}
+
+function updateMusicPlayback() {
+  if (
+    !timerState ||
+    typeof window.p5PlayMusic !==
+      'function'
+  ) {
+    return;
+  }
+
+  window.p5PlayMusic(
+    timerState.music &&
+    timerState.isRunning
+  );
+}
+
+// -----------------------------------------------------
+// PRESETS
+// -----------------------------------------------------
+
+window.applyPresetFromValue =
+  async function (value) {
+    if (!timerState) return;
+
+    if (value === 'custom') {
+      customFields.classList.remove(
+        'hidden'
+      );
+    } else {
+      customFields.classList.add(
+        'hidden'
+      );
+    }
+
+    let workMinutes = 25;
+    let restMinutes = 5;
+
+    if (value === '15-3') {
+      workMinutes = 15;
+      restMinutes = 3;
+    }
+
+    if (value === '5-1') {
+      workMinutes = 5;
+      restMinutes = 1;
+    }
+
+    if (value === 'custom') {
+      workMinutes = Math.max(
+        1,
+        Math.min(
+          180,
+          Number.parseInt(
+            workMin.value || '20',
+            10
+          )
+        )
+      );
+
+      restMinutes = Math.max(
+        1,
+        Math.min(
+          60,
+          Number.parseInt(
+            restMin.value || '5',
+            10
+          )
+        )
+      );
+    }
+
+    workMin.value = workMinutes;
+    restMin.value = restMinutes;
+
+    await sendTimerMessage(
+      'TIMER_APPLY_DURATIONS',
+      {
+        workMs:
+          workMinutes * 60 * 1000,
+
+        restMs:
+          restMinutes * 60 * 1000
+      }
+    );
+  };
+
+// -----------------------------------------------------
+// EVENTOS DEL BACKGROUND
+// -----------------------------------------------------
+
+browser.runtime.onMessage.addListener(
+  (message) => {
+    if (
+      message.type ===
+        'TIMER_STATE_UPDATED' &&
+      message.state
+    ) {
+      timerState = message.state;
+
+      updateInterface();
+      syncP5();
+      updateMusicPlayback();
+    }
+
+    if (
+      message.type ===
+        'TIMER_PHASE_FINISHED' &&
+      message.state
+    ) {
+      timerState = message.state;
+
+      if (
+        typeof window
+          .p5PlayNotifSound ===
+        'function'
+      ) {
+        window.p5PlayNotifSound();
+      }
+
+      updateInterface();
+      syncP5();
+      updateMusicPlayback();
+    }
+  }
+);
+
+// -----------------------------------------------------
+// ACTUALIZACIÓN VISUAL
+// -----------------------------------------------------
+
+setInterval(() => {
+  if (!timerState) return;
+
+  timeLabel.textContent =
+    msToMMSS(getRemainingMs());
+
+  if (
+    typeof window.p5SetRemaining ===
+    'function'
+  ) {
+    window.p5SetRemaining(
+      getRemainingMs()
+    );
+  }
+}, 250);
+
+// -----------------------------------------------------
+// INICIALIZACIÓN
+// -----------------------------------------------------
+
+document.addEventListener(
+  'DOMContentLoaded',
+  async () => {
+    customFields =
+      getElement('custom-fields');
+
+    workMin =
+      getElement('workMin');
+
+    restMin =
+      getElement('restMin');
+
+    startPauseBtn =
+      getElement('startPauseBtn');
+
+    resetBtn =
+      getElement('resetBtn');
+
+    skipBtn =
+      getElement('skipBtn');
+
+    musicToggle =
+      getElement('musicToggle');
+
+    notifToggle =
+      getElement('notifToggle');
+
+    phaseLabel =
+      getElement('phaseLabel');
+
+    timeLabel =
+      getElement('timeLabel');
+
+    startPauseBtn.addEventListener(
+      'click',
+      async () => {
+        if (timerState?.isRunning) {
+          await sendTimerMessage(
+            'TIMER_PAUSE'
+          );
+        } else {
+          await sendTimerMessage(
+            'TIMER_START'
+          );
+        }
+      }
+    );
+
+    resetBtn.addEventListener(
+      'click',
+      async () => {
+        await sendTimerMessage(
+          'TIMER_RESET'
+        );
+      }
+    );
+
+    skipBtn?.addEventListener(
+      'click',
+      async () => {
+        await sendTimerMessage(
+          'TIMER_SKIP'
+        );
+      }
+    );
+
+    musicToggle.addEventListener(
+      'change',
+      async () => {
+        await sendTimerMessage(
+          'TIMER_UPDATE_SETTINGS',
+          {
+            settings: {
+              music:
+                musicToggle.checked
+            }
+          }
+        );
+      }
+    );
+
+    notifToggle.addEventListener(
+      'change',
+      async () => {
+        await sendTimerMessage(
+          'TIMER_UPDATE_SETTINGS',
+          {
+            settings: {
+              notif:
+                notifToggle.checked
+            }
+          }
+        );
+      }
+    );
+
+    workMin.addEventListener(
+      'change',
+      () => {
+        window.applyPresetFromValue(
+          'custom'
+        );
+      }
+    );
+
+    restMin.addEventListener(
+      'change',
+      () => {
+        window.applyPresetFromValue(
+          'custom'
+        );
+      }
+    );
+
+    getElement(
+      'clearDataBtn'
+    ).addEventListener(
+      'click',
+      async () => {
+        const confirmed =
+          window.confirm(
+            'Vols eliminar les preferències i restablir el temporitzador?'
+          );
+
+        if (!confirmed) return;
+
+        await sendTimerMessage(
+          'TIMER_CLEAR_DATA'
+        );
+
+        location.reload();
+      }
+    );
+
+    await loadTimerState();
+
+    if (timerState) {
+      workMin.value = Math.round(
+        timerState.workMs / 60000
+      );
+
+      restMin.value = Math.round(
+        timerState.restMs / 60000
+      );
+    }
+  }
+);
