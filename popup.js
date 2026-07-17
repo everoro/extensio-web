@@ -1,9 +1,38 @@
 // -----------------------------------------------------
 // MINUTS AL JARDÍ
-// Interfície del popup
+// Mode dual: extensió Firefox + demo web
 // -----------------------------------------------------
 
+const WEB_STORAGE_KEY = 'minuts_al_jardi_web_v1';
+
+const extensionAPI =
+  globalThis.browser ??
+  globalThis.chrome ??
+  null;
+
+const isExtensionEnvironment = Boolean(
+  extensionAPI?.runtime?.sendMessage
+);
+
+const DEFAULT_STATE = {
+  phase: 'work',
+  isRunning: false,
+
+  workMs: 25 * 60 * 1000,
+  restMs: 5 * 60 * 1000,
+
+  remainingMs: 25 * 60 * 1000,
+  endsAt: null,
+
+  autoSwitch: true,
+  music: true,
+  notif: true,
+
+  completedWorkSessions: 0
+};
+
 let timerState = null;
+let webTicker = null;
 
 let customFields;
 let workMin;
@@ -19,8 +48,25 @@ let notifToggle;
 let phaseLabel;
 let timeLabel;
 
+// -----------------------------------------------------
+// HELPERS
+// -----------------------------------------------------
+
 function getElement(id) {
   return document.getElementById(id);
+}
+
+function cloneDefaultState() {
+  return {
+    ...DEFAULT_STATE
+  };
+}
+
+function clamp(value, min, max) {
+  return Math.max(
+    min,
+    Math.min(max, value)
+  );
 }
 
 function msToMMSS(milliseconds) {
@@ -44,6 +90,16 @@ function msToMMSS(milliseconds) {
   return `${minutes}:${seconds}`;
 }
 
+function getPhaseDuration() {
+  if (!timerState) {
+    return DEFAULT_STATE.workMs;
+  }
+
+  return timerState.phase === 'work'
+    ? timerState.workMs
+    : timerState.restMs;
+}
+
 function getRemainingMs() {
   if (!timerState) return 0;
 
@@ -63,28 +119,97 @@ function getRemainingMs() {
   );
 }
 
-async function sendTimerMessage(
+function normalizeState(saved = {}) {
+  const state = {
+    ...cloneDefaultState(),
+    ...saved
+  };
+
+  state.phase =
+    state.phase === 'rest'
+      ? 'rest'
+      : 'work';
+
+  state.workMs = clamp(
+    Number(state.workMs) ||
+      DEFAULT_STATE.workMs,
+    60 * 1000,
+    180 * 60 * 1000
+  );
+
+  state.restMs = clamp(
+    Number(state.restMs) ||
+      DEFAULT_STATE.restMs,
+    60 * 1000,
+    60 * 60 * 1000
+  );
+
+  state.remainingMs = Math.max(
+    0,
+    Number(state.remainingMs) ||
+      (
+        state.phase === 'work'
+          ? state.workMs
+          : state.restMs
+      )
+  );
+
+  state.endsAt =
+    Number.isFinite(state.endsAt)
+      ? state.endsAt
+      : null;
+
+  state.isRunning =
+    Boolean(state.isRunning) &&
+    Number.isFinite(state.endsAt);
+
+  state.music =
+    state.music !== false;
+
+  state.notif =
+    state.notif !== false;
+
+  state.autoSwitch =
+    state.autoSwitch !== false;
+
+  state.completedWorkSessions =
+    Math.max(
+      0,
+      Number.parseInt(
+        state.completedWorkSessions,
+        10
+      ) || 0
+    );
+
+  return state;
+}
+
+// -----------------------------------------------------
+// COMUNICACIÓ AMB L’EXTENSIÓ
+// -----------------------------------------------------
+
+async function sendExtensionMessage(
   type,
   data = {}
 ) {
   try {
     const response =
-      await browser.runtime.sendMessage({
+      await extensionAPI.runtime.sendMessage({
         type,
         ...data
       });
 
     if (response?.state) {
-      timerState = response.state;
-      updateInterface();
-      syncP5();
-      updateMusicPlayback();
+      timerState =
+        normalizeState(response.state);
+
+      renderAll();
     }
 
     return response;
   } catch (error) {
     console.error(
-      'Error comunicant amb el temporitzador:',
+      'Error comunicant amb el background:',
       error
     );
 
@@ -92,76 +217,335 @@ async function sendTimerMessage(
   }
 }
 
-async function loadTimerState() {
-  await sendTimerMessage(
-    'TIMER_GET_STATE'
-  );
+// -----------------------------------------------------
+// MODE WEB
+// -----------------------------------------------------
+
+function loadWebState() {
+  try {
+    const saved = JSON.parse(
+      localStorage.getItem(
+        WEB_STORAGE_KEY
+      ) || '{}'
+    );
+
+    timerState =
+      normalizeState(saved);
+
+    restoreExpiredWebTimer();
+  } catch (error) {
+    console.warn(
+      'No s’ha pogut carregar el temporitzador web.',
+      error
+    );
+
+    timerState =
+      cloneDefaultState();
+  }
 }
 
-function updateInterface() {
+function saveWebState() {
   if (!timerState) return;
 
-  const remaining =
+  timerState.remainingMs =
     getRemainingMs();
 
-  phaseLabel.textContent =
-    timerState.phase === 'work'
-      ? 'Treball'
-      : 'Descans';
-
-  timeLabel.textContent =
-    msToMMSS(remaining);
-
-  startPauseBtn.textContent =
-    timerState.isRunning
-      ? 'Pausa'
-      : 'Inicia';
-
-  startPauseBtn.setAttribute(
-    'aria-label',
-    timerState.isRunning
-      ? 'Pausar el temporitzador'
-      : 'Iniciar el temporitzador'
-  );
-
-  musicToggle.checked =
-    timerState.music;
-
-  notifToggle.checked =
-    timerState.notif;
-
-  document.body.dataset.phase =
-    timerState.phase;
+  try {
+    localStorage.setItem(
+      WEB_STORAGE_KEY,
+      JSON.stringify(timerState)
+    );
+  } catch (error) {
+    console.warn(
+      'No s’ha pogut desar el temporitzador web.',
+      error
+    );
+  }
 }
 
-function syncP5() {
-  if (
-    !timerState ||
-    typeof window.p5UpdateConfig !==
-      'function'
-  ) {
-    return;
+function startWebTimer() {
+  if (timerState.isRunning) return;
+
+  if (timerState.remainingMs <= 0) {
+    timerState.remainingMs =
+      getPhaseDuration();
   }
 
-  window.p5UpdateConfig({
-    ...timerState,
-    remainingMs: getRemainingMs()
+  timerState.isRunning = true;
+
+  timerState.endsAt =
+    Date.now() +
+    timerState.remainingMs;
+
+  saveWebState();
+  renderAll();
+}
+
+function pauseWebTimer() {
+  if (!timerState.isRunning) return;
+
+  timerState.remainingMs =
+    getRemainingMs();
+
+  timerState.isRunning = false;
+  timerState.endsAt = null;
+
+  saveWebState();
+  renderAll();
+}
+
+function resetWebTimer() {
+  timerState.phase = 'work';
+  timerState.isRunning = false;
+
+  timerState.remainingMs =
+    timerState.workMs;
+
+  timerState.endsAt = null;
+
+  saveWebState();
+  renderAll();
+}
+
+function skipWebPhase() {
+  const continueRunning =
+    timerState.isRunning;
+
+  switchWebPhase({
+    continueRunning,
+    notify: false
   });
 }
 
-function updateMusicPlayback() {
+function finishWebPhase() {
+  const finishedPhase =
+    timerState.phase;
+
+  if (finishedPhase === 'work') {
+    timerState.completedWorkSessions += 1;
+  }
+
+  playCompletionFeedback(
+    finishedPhase
+  );
+
+  switchWebPhase({
+    continueRunning:
+      timerState.autoSwitch,
+    notify: false
+  });
+}
+
+function switchWebPhase({
+  continueRunning = false,
+  notify = false
+} = {}) {
+  const previousPhase =
+    timerState.phase;
+
+  timerState.phase =
+    previousPhase === 'work'
+      ? 'rest'
+      : 'work';
+
+  timerState.remainingMs =
+    getPhaseDuration();
+
+  timerState.isRunning =
+    continueRunning;
+
+  timerState.endsAt =
+    continueRunning
+      ? Date.now() +
+        timerState.remainingMs
+      : null;
+
+  if (notify) {
+    playCompletionFeedback(
+      previousPhase
+    );
+  }
+
+  saveWebState();
+  renderAll();
+}
+
+function restoreExpiredWebTimer() {
   if (
-    !timerState ||
-    typeof window.p5PlayMusic !==
-      'function'
+    !timerState.isRunning ||
+    !Number.isFinite(
+      timerState.endsAt
+    )
   ) {
     return;
   }
 
-  window.p5PlayMusic(
-    timerState.music &&
-    timerState.isRunning
+  const remaining =
+    timerState.endsAt -
+    Date.now();
+
+  if (remaining > 0) {
+    timerState.remainingMs =
+      remaining;
+
+    return;
+  }
+
+  timerState.isRunning = false;
+  timerState.endsAt = null;
+  timerState.remainingMs = 0;
+
+  const finishedPhase =
+    timerState.phase;
+
+  if (finishedPhase === 'work') {
+    timerState.completedWorkSessions += 1;
+  }
+
+  timerState.phase =
+    finishedPhase === 'work'
+      ? 'rest'
+      : 'work';
+
+  timerState.remainingMs =
+    getPhaseDuration();
+
+  timerState.isRunning = false;
+  timerState.endsAt = null;
+
+  saveWebState();
+}
+
+// -----------------------------------------------------
+// ACCIONS COMUNES
+// -----------------------------------------------------
+
+async function startOrPause() {
+  if (isExtensionEnvironment) {
+    await sendExtensionMessage(
+      timerState?.isRunning
+        ? 'TIMER_PAUSE'
+        : 'TIMER_START'
+    );
+
+    return;
+  }
+
+  if (timerState.isRunning) {
+    pauseWebTimer();
+  } else {
+    startWebTimer();
+  }
+}
+
+async function resetTimer() {
+  if (isExtensionEnvironment) {
+    await sendExtensionMessage(
+      'TIMER_RESET'
+    );
+
+    return;
+  }
+
+  resetWebTimer();
+}
+
+async function skipPhase() {
+  if (isExtensionEnvironment) {
+    await sendExtensionMessage(
+      'TIMER_SKIP'
+    );
+
+    return;
+  }
+
+  skipWebPhase();
+}
+
+async function applyDurations(
+  workMinutes,
+  restMinutes
+) {
+  const workMs =
+    workMinutes * 60 * 1000;
+
+  const restMs =
+    restMinutes * 60 * 1000;
+
+  if (isExtensionEnvironment) {
+    await sendExtensionMessage(
+      'TIMER_APPLY_DURATIONS',
+      {
+        workMs,
+        restMs
+      }
+    );
+
+    return;
+  }
+
+  timerState.workMs = workMs;
+  timerState.restMs = restMs;
+
+  if (!timerState.isRunning) {
+    timerState.remainingMs =
+      getPhaseDuration();
+
+    timerState.endsAt = null;
+  }
+
+  saveWebState();
+  renderAll();
+}
+
+async function updateSettings(
+  settings
+) {
+  if (isExtensionEnvironment) {
+    await sendExtensionMessage(
+      'TIMER_UPDATE_SETTINGS',
+      {
+        settings
+      }
+    );
+
+    return;
+  }
+
+  timerState = {
+    ...timerState,
+    ...settings
+  };
+
+  saveWebState();
+  renderAll();
+}
+
+async function clearAppData() {
+  const confirmed =
+    window.confirm(
+      'Vols eliminar les preferències i restablir el temporitzador?'
+    );
+
+  if (!confirmed) return;
+
+  if (isExtensionEnvironment) {
+    await sendExtensionMessage(
+      'TIMER_CLEAR_DATA'
+    );
+
+    location.reload();
+    return;
+  }
+
+  localStorage.removeItem(
+    WEB_STORAGE_KEY
   );
+
+  timerState =
+    cloneDefaultState();
+
+  renderAll();
 }
 
 // -----------------------------------------------------
@@ -169,15 +553,17 @@ function updateMusicPlayback() {
 // -----------------------------------------------------
 
 window.applyPresetFromValue =
-  async function (value) {
+  async function applyPresetFromValue(
+    value
+  ) {
     if (!timerState) return;
 
     if (value === 'custom') {
-      customFields.classList.remove(
+      customFields?.classList.remove(
         'hidden'
       );
     } else {
-      customFields.classList.add(
+      customFields?.classList.add(
         'hidden'
       );
     }
@@ -196,106 +582,293 @@ window.applyPresetFromValue =
     }
 
     if (value === 'custom') {
-      workMinutes = Math.max(
+      workMinutes = clamp(
+        Number.parseInt(
+          workMin?.value || '20',
+          10
+        ),
         1,
-        Math.min(
-          180,
-          Number.parseInt(
-            workMin.value || '20',
-            10
-          )
-        )
+        180
       );
 
-      restMinutes = Math.max(
+      restMinutes = clamp(
+        Number.parseInt(
+          restMin?.value || '5',
+          10
+        ),
         1,
-        Math.min(
-          60,
-          Number.parseInt(
-            restMin.value || '5',
-            10
-          )
-        )
+        60
       );
     }
 
-    workMin.value = workMinutes;
-    restMin.value = restMinutes;
+    if (workMin) {
+      workMin.value =
+        workMinutes;
+    }
 
-    await sendTimerMessage(
-      'TIMER_APPLY_DURATIONS',
-      {
-        workMs:
-          workMinutes * 60 * 1000,
+    if (restMin) {
+      restMin.value =
+        restMinutes;
+    }
 
-        restMs:
-          restMinutes * 60 * 1000
-      }
+    await applyDurations(
+      workMinutes,
+      restMinutes
     );
   };
 
 // -----------------------------------------------------
-// EVENTOS DEL BACKGROUND
+// NOTIFICACIONS I SO
 // -----------------------------------------------------
 
-browser.runtime.onMessage.addListener(
-  (message) => {
-    if (
-      message.type ===
-        'TIMER_STATE_UPDATED' &&
-      message.state
-    ) {
-      timerState = message.state;
-
-      updateInterface();
-      syncP5();
-      updateMusicPlayback();
-    }
-
-    if (
-      message.type ===
-        'TIMER_PHASE_FINISHED' &&
-      message.state
-    ) {
-      timerState = message.state;
-
-      if (
-        typeof window
-          .p5PlayNotifSound ===
-        'function'
-      ) {
-        window.p5PlayNotifSound();
-      }
-
-      updateInterface();
-      syncP5();
-      updateMusicPlayback();
-    }
+async function requestWebNotificationPermission() {
+  if (
+    isExtensionEnvironment ||
+    !('Notification' in window)
+  ) {
+    return;
   }
-);
-
-// -----------------------------------------------------
-// ACTUALIZACIÓN VISUAL
-// -----------------------------------------------------
-
-setInterval(() => {
-  if (!timerState) return;
-
-  timeLabel.textContent =
-    msToMMSS(getRemainingMs());
 
   if (
-    typeof window.p5SetRemaining ===
+    Notification.permission ===
+    'default'
+  ) {
+    try {
+      await Notification
+        .requestPermission();
+    } catch (error) {
+      console.warn(
+        'No s’ha pogut demanar permís de notificació.',
+        error
+      );
+    }
+  }
+}
+
+function playCompletionFeedback(
+  finishedPhase
+) {
+  if (
+    typeof window.p5PlayNotifSound ===
     'function'
   ) {
-    window.p5SetRemaining(
-      getRemainingMs()
-    );
+    window.p5PlayNotifSound();
   }
-}, 250);
+
+  if (
+    !timerState.notif ||
+    isExtensionEnvironment ||
+    !('Notification' in window) ||
+    Notification.permission !==
+      'granted'
+  ) {
+    return;
+  }
+
+  const finishedWork =
+    finishedPhase === 'work';
+
+  new Notification(
+    'Minuts al Jardí',
+    {
+      body: finishedWork
+        ? 'Has acabat la sessió de treball. És hora de descansar.'
+        : 'Has acabat el descans. Tornem-hi!',
+
+      icon: './assets/icon48.png'
+    }
+  );
+}
 
 // -----------------------------------------------------
-// INICIALIZACIÓN
+// INTERFÍCIE I P5
+// -----------------------------------------------------
+
+function updateInterface() {
+  if (!timerState) return;
+
+  const remaining =
+    getRemainingMs();
+
+  if (phaseLabel) {
+    phaseLabel.textContent =
+      timerState.phase === 'work'
+        ? 'Treball'
+        : 'Descans';
+  }
+
+  if (timeLabel) {
+    timeLabel.textContent =
+      msToMMSS(remaining);
+  }
+
+  if (startPauseBtn) {
+    startPauseBtn.textContent =
+      timerState.isRunning
+        ? 'Pausa'
+        : 'Inicia';
+
+    startPauseBtn.setAttribute(
+      'aria-label',
+      timerState.isRunning
+        ? 'Pausar el temporitzador'
+        : 'Iniciar el temporitzador'
+    );
+  }
+
+  if (musicToggle) {
+    musicToggle.checked =
+      timerState.music;
+  }
+
+  if (notifToggle) {
+    notifToggle.checked =
+      timerState.notif;
+  }
+
+  document.body.dataset.phase =
+    timerState.phase;
+
+  document.body.dataset.environment =
+    isExtensionEnvironment
+      ? 'extension'
+      : 'web';
+}
+
+function syncP5() {
+  if (
+    !timerState ||
+    typeof window.p5UpdateConfig !==
+      'function'
+  ) {
+    return;
+  }
+
+  window.p5UpdateConfig({
+    ...timerState,
+    remainingMs:
+      getRemainingMs()
+  });
+}
+
+function updateMusicPlayback() {
+  if (
+    !timerState ||
+    typeof window.p5PlayMusic !==
+      'function'
+  ) {
+    return;
+  }
+
+  window.p5PlayMusic(
+    timerState.music &&
+    timerState.isRunning
+  );
+}
+
+function renderAll() {
+  updateInterface();
+  syncP5();
+  updateMusicPlayback();
+}
+
+// -----------------------------------------------------
+// MISSATGES DEL BACKGROUND
+// -----------------------------------------------------
+
+if (
+  isExtensionEnvironment &&
+  extensionAPI?.runtime?.onMessage
+) {
+  extensionAPI.runtime.onMessage.addListener(
+    (message) => {
+      if (
+        message?.type ===
+          'TIMER_STATE_UPDATED' &&
+        message.state
+      ) {
+        timerState =
+          normalizeState(
+            message.state
+          );
+
+        renderAll();
+      }
+
+      if (
+        message?.type ===
+          'TIMER_PHASE_FINISHED' &&
+        message.state
+      ) {
+        timerState =
+          normalizeState(
+            message.state
+          );
+
+        if (
+          typeof window
+            .p5PlayNotifSound ===
+            'function'
+        ) {
+          window.p5PlayNotifSound();
+        }
+
+        renderAll();
+      }
+    }
+  );
+}
+
+// -----------------------------------------------------
+// ACTUALITZACIÓ VISUAL
+// -----------------------------------------------------
+
+function startVisualTicker() {
+  clearInterval(webTicker);
+
+  webTicker = setInterval(() => {
+    if (!timerState) return;
+
+    const remaining =
+      getRemainingMs();
+
+    if (
+      !isExtensionEnvironment &&
+      timerState.isRunning &&
+      remaining <= 0
+    ) {
+      finishWebPhase();
+      return;
+    }
+
+    if (timeLabel) {
+      timeLabel.textContent =
+        msToMMSS(remaining);
+    }
+
+    if (
+      typeof window.p5SetRemaining ===
+        'function'
+    ) {
+      window.p5SetRemaining(
+        remaining
+      );
+    }
+
+    if (
+      !isExtensionEnvironment &&
+      timerState.isRunning
+    ) {
+      timerState.remainingMs =
+        remaining;
+
+      saveWebState();
+    }
+  }, 250);
+}
+
+// -----------------------------------------------------
+// INICIALITZACIÓ
 // -----------------------------------------------------
 
 document.addEventListener(
@@ -331,70 +904,46 @@ document.addEventListener(
     timeLabel =
       getElement('timeLabel');
 
-    startPauseBtn.addEventListener(
+    startPauseBtn?.addEventListener(
       'click',
-      async () => {
-        if (timerState?.isRunning) {
-          await sendTimerMessage(
-            'TIMER_PAUSE'
-          );
-        } else {
-          await sendTimerMessage(
-            'TIMER_START'
-          );
-        }
-      }
+      startOrPause
     );
 
-    resetBtn.addEventListener(
+    resetBtn?.addEventListener(
       'click',
-      async () => {
-        await sendTimerMessage(
-          'TIMER_RESET'
-        );
-      }
+      resetTimer
     );
 
     skipBtn?.addEventListener(
       'click',
-      async () => {
-        await sendTimerMessage(
-          'TIMER_SKIP'
-        );
-      }
+      skipPhase
     );
 
-    musicToggle.addEventListener(
+    musicToggle?.addEventListener(
       'change',
       async () => {
-        await sendTimerMessage(
-          'TIMER_UPDATE_SETTINGS',
-          {
-            settings: {
-              music:
-                musicToggle.checked
-            }
-          }
-        );
+        await updateSettings({
+          music:
+            musicToggle.checked
+        });
       }
     );
 
-    notifToggle.addEventListener(
+    notifToggle?.addEventListener(
       'change',
       async () => {
-        await sendTimerMessage(
-          'TIMER_UPDATE_SETTINGS',
-          {
-            settings: {
-              notif:
-                notifToggle.checked
-            }
-          }
-        );
+        await updateSettings({
+          notif:
+            notifToggle.checked
+        });
+
+        if (notifToggle.checked) {
+          await requestWebNotificationPermission();
+        }
       }
     );
 
-    workMin.addEventListener(
+    workMin?.addEventListener(
       'change',
       () => {
         window.applyPresetFromValue(
@@ -403,7 +952,7 @@ document.addEventListener(
       }
     );
 
-    restMin.addEventListener(
+    restMin?.addEventListener(
       'change',
       () => {
         window.applyPresetFromValue(
@@ -414,34 +963,42 @@ document.addEventListener(
 
     getElement(
       'clearDataBtn'
-    ).addEventListener(
+    )?.addEventListener(
       'click',
-      async () => {
-        const confirmed =
-          window.confirm(
-            'Vols eliminar les preferències i restablir el temporitzador?'
-          );
-
-        if (!confirmed) return;
-
-        await sendTimerMessage(
-          'TIMER_CLEAR_DATA'
-        );
-
-        location.reload();
-      }
+      clearAppData
     );
 
-    await loadTimerState();
+    if (isExtensionEnvironment) {
+      const response =
+        await sendExtensionMessage(
+          'TIMER_GET_STATE'
+        );
 
-    if (timerState) {
-      workMin.value = Math.round(
-        timerState.workMs / 60000
-      );
-
-      restMin.value = Math.round(
-        timerState.restMs / 60000
-      );
+      if (!response?.state) {
+        timerState =
+          cloneDefaultState();
+      }
+    } else {
+      loadWebState();
     }
+
+    if (workMin && timerState) {
+      workMin.value =
+        Math.round(
+          timerState.workMs /
+          60000
+        );
+    }
+
+    if (restMin && timerState) {
+      restMin.value =
+        Math.round(
+          timerState.restMs /
+          60000
+        );
+    }
+
+    renderAll();
+    startVisualTicker();
   }
 );
