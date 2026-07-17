@@ -1,13 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "Temporitzador de descansos (p5.js)",
-  "version": "1.0.0",
-  "description": "Extensió de Firefox amb p5.js per gestionar descansos amb una flor animada.",
+  "name": "Minuts al Jardí",
+  "version": "1.1.0",
+  "description": "Temporitzador de concentració que transforma cada minut completat en un pètal.",
   "author": "Evelyn Rosado Romero",
 
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Temporitzador de descansos"
+    "default_title": "Minuts al Jardí"
+  },
+
+  "background": {
+    "scripts": ["background.js"],
+    "service_worker": "background.js"
   },
 
   "icons": {
@@ -16,16 +21,13 @@
 
   "permissions": [
     "storage",
-    "notifications"
+    "notifications",
+    "alarms"
   ],
-
-  "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-  },
 
   "browser_specific_settings": {
     "gecko": {
-      "id": "minuts-jardi@uoc-evelyn",
+      "id": "minuts-al-jardi@evelynrosado",
       "strict_min_version": "109.0"
     }
   }
