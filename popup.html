@@ -8,13 +8,15 @@
   <!-- Estils CSS -->
   <link rel="stylesheet" href="style.css" />
   
-<script src="libs/p5.min.js"></script>
-<!-- Comentem p5.sound per evitar conflictes amb CSP -->
-<!-- <script src="libs/p5.sound.min.js"></script> -->
-<script src="sketch.js" defer></script>
-<script src="popup.js" defer></script>
+  <script src="libs/p5.min.js"></script>
+<script src="libs/p5.sound.min.js"></script>
 
 
+  <!-- sketch primer (canvas, música, botó Mode) -->
+  <script src="sketch.js" defer></script>
+
+  <!-- després la lògica del temporitzador -->
+  <script src="popup.js" defer></script>
 </head>
 <body>
   <div id="app" role="application" aria-label="Temporitzador de descansos">
@@ -27,7 +29,7 @@
         <h1>TEMPORITZADOR</h1>
       </div>
 
-      <!-- Segona barra: (botó Mode) -->
+      <!-- Segona barra: (p5.js generarà aquí el botó Mode) -->
       <div id="presetMenu"></div>
 
       <!-- Camps per al mode personalitzat -->
@@ -57,8 +59,15 @@
 
       <!-- Controls -->
       <div class="controls">
-        <button id="startPauseBtn" type="button">Inicia</button>
-        <button id="resetBtn" type="button" class="secondary">Reinicia</button>
+  <button id="startPauseBtn" type="button">Inicia</button>
+
+  <button id="resetBtn" type="button" class="secondary">
+    Reinicia
+  </button>
+
+  <button id="skipBtn" type="button" class="secondary">
+    Salta fase
+  </button>
 
         <label class="inline">
           <input type="checkbox" id="musicToggle" checked />
@@ -85,5 +94,7 @@
   </div>
 </body>
 </html>
+
+
 
 
